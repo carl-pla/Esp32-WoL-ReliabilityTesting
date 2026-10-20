@@ -1,40 +1,60 @@
 # ESP32 Remote Wake Gateway
 
-A low-cost ESP32-based Wake-on-LAN (WOL) gateway that receives remote commands over MQTT, sends Wake-on-LAN magic packets on the local network, and reports a verifiable status chain for every command.
+A low-cost ESP32-based Wake-on-LAN gateway for remotely starting a computer without keeping a general-purpose server running around the clock.
 
-The project focuses on **reliability and observability**, not only on sending a magic packet. Each wake command receives a unique command ID and produces structured status events, so you can distinguish between “the command arrived”, “the packet was sent”, and “the target PC became reachable”.
+The ESP32 receives commands through an outbound MQTT-over-TLS connection, generates Wake-on-LAN magic packets on the local network, and publishes structured status events.
+
+The project focuses on **observability** and improving reliability: distinguishing command reception, local packet transmission, and subsequent target-service reachability.
+
+## Project status
+
+This project is under active development.
+
+The current firmware is a prototype intended for personal and lab use.
+It is not a high-availability system, and production readiness has not yet been established.
+
+Reliability is an engineering goal, not a measured guarantee.
 
 ## Why this project exists
 
-Wake-on-LAN is often treated as a simple one-shot action: send a magic packet and hope the target machine starts. In practice, remote WOL can fail for several unrelated reasons:
+The project started with two practical constraints:
 
-- The MQTT command never reaches the ESP32.
-- The ESP32 loses Wi-Fi or its MQTT connection.
-- The command is received, but the UDP packet cannot be sent.
-- The magic packet is sent, but the target PC does not respond.
-- The target PC is in a power state that does not support WOL.
-- The target MAC address, broadcast address, or network path is incorrect.
+1. The home internet connection was behind carrier-grade NAT (CGNAT), making conventional inbound IPv4 port forwarding unsuitable.
+2. Keeping a gaming PC powered on continuously just to remain remotely accessible was not desirable because of its electricity consumption.
 
-This project separates those cases with an explicit status chain:
+The solution separates the always-on control device from the computer that performs the actual workloads:
 
-```text
-RECEIVED -> SENT -> ONLINE
-```
+- The ESP32 remains powered and connected to the network.
+- The target computer can remain shut down when it is not needed.
+- A remote MQTT command instructs the ESP32 to send a local Wake-on-LAN packet.
+- After startup, the computer can be accessed through a separate remote-access solution.
 
-or:
+### Why MQTT helps with CGNAT
 
-```text
-RECEIVED -> SENT -> TIMEOUT
-```
+CGNAT is typically operated by the internet service provider.
+It allows multiple subscribers to share public IPv4 addresses.
 
-`SENT` means that the ESP32 successfully submitted the UDP magic packet. It does **not** prove that the target PC received or processed it. `ONLINE` means that the ESP32 later detected the target PC as reachable.
+Devices in the home network still have private IP addresses.
+The constraint is that the home connection may not have a dedicated, directly reachable public IPv4 address.
+
+Instead of requiring an incoming connection to the home network, the ESP32 initiates an outbound connection to a reachable MQTT broker.
+The broker forwards commands over that existing connection.
+
+This architecture does not require:
+
+- A dedicated public IPv4 address at home
+- Inbound router port forwarding for the wake command
+- A VPN client running on the ESP32
+- The target computer to remain powered on
+
+The network must still permit the required outbound DNS and MQTT-over-TLS traffic.
 
 ## How it works
 
 ```mermaid
 flowchart LR
     subgraph REMOTE["Remote device"]
-        CLIENT["MacBook / iPhone<br/>MQTT client"]
+        CLIENT["Laptop / Smartphone<br/>MQTT client"]
     end
 
     subgraph CLOUD["Reachable MQTT service"]
@@ -43,7 +63,7 @@ flowchart LR
 
     subgraph HOME["Home network"]
         ESP["ESP32 Wake Gateway<br/>Always-on · Wi-Fi<br/>Independent power supply"]
-        SERVER["Target server / PC<br/>Ethernet connection<br/>Wake-on-LAN enabled"]
+        SERVER["Target computer<br/>Ethernet connection<br/>Wake-on-LAN enabled"]
     end
 
     CLIENT -->|"Publish wake command<br/>MQTT over TLS"| BROKER
@@ -55,7 +75,7 @@ flowchart LR
     ESP -->|"Publish status and logs"| BROKER
     BROKER -->|"Deliver subscribed feedback"| CLIENT
 
-    CLIENT -.->|"Optional Tailscale access<br/>after server startup"| SERVER
+    CLIENT -.->|"Optional remote access<br/>e.g. Tailscale, after startup"| SERVER
 
     classDef device fill:#6699ee,stroke:#365e9d,stroke-width:2px,color:#10213b;
     classDef broker fill:#ffa34d,stroke:#b86516,stroke-width:2px,color:#33200e;
@@ -74,100 +94,243 @@ flowchart LR
     linkStyle 6 stroke:#8250c4,stroke-width:2px;
 ```
 
-The ESP32 initiates and maintains an outbound connection to the MQTT broker.
-The broker forwards commands over that existing connection.
+### Broker independence
 
-EMQX Cloud is the reference broker used in this project, not a required dependency.
-Another MQTT broker can be used if it supports the firmware's MQTT version,
-TLS connection settings, authentication, and required topic permissions.
+EMQX Cloud is the reference broker used for this project, not a required dependency.
+
+Another reachable MQTT broker can be used if it supports:
+
+- The MQTT protocol version used by the firmware
+- MQTT over TLS
+- Compatible authentication
+- The required publish and subscribe permissions
 
 Provider-specific authentication mechanisms may require firmware changes.
 
+The broker must remain available while the target computer is shut down.
+Hosting the only broker on the computer being woken would create a circular dependency.
+
+### Remote access after startup
+
 Tailscale is optional and separate from the wake-command path.
-When both MQTT clients can reach the broker, waking the server does not require
-a VPN connection.
 
-The target server is not required to be running for the ESP32 to receive a
-wake command. The ESP32, its power supply, network infrastructure, and MQTT
-broker must remain available.
+When both MQTT clients can reach the broker, waking the computer does not require a VPN connection.
 
-
-### Status interpretation
-
-- `RECEIVED`: The command reached the ESP32 and passed validation.
-- `SENT`: At least one local UDP send operation succeeded.
-- `ONLINE`: The configured TCP service was reachable during the verification window.
-- `TIMEOUT`: The configured TCP service was not detected before the deadline.
-
-`SENT` does not confirm that the target received the magic packet.
-`ONLINE` confirms service reachability, not necessarily that this command caused the server to start.
+After startup, Tailscale or another remote-access solution can provide access to the target computer.
+Sending a wake command does not itself establish a remote desktop or SSH session.
 
 ### Network boundaries
 
-- The ESP32 and the target server share the local network used for the WOL broadcast.
-- The ESP32 remains independently powered while the server is shut down.
-- Tailscale is a separate access path for use after the server starts.
-- The MQTT wake workflow does not require Tailscale when both clients can reach the broker.
-- The server's internal VMs, VLANs, and sandbox firewall are outside the scope of this diagram.
+- The ESP32 sends the magic packet within the target computer's local broadcast domain.
+- The ESP32 remains independently powered while the target computer is shut down.
+- The router, Wi-Fi access point or repeater, internet connection, and MQTT broker must remain available.
+- A repeater or access point must allow the required communication between the ESP32 and the target computer.
+- Internal virtual machines, VLANs, and unrelated firewall experiments are outside the scope of this project.
 
-## Key features
+## Why status feedback matters
 
-- MQTT-based remote Wake-on-LAN
-- TLS-secured MQTT connection using a root CA certificate
-- Unique command IDs to correlate every WOL attempt
-- Duplicate-command detection
-- Structured JSON status and log messages
-- Explicit status chain: `RECEIVED`, `SENT`, `ONLINE`, or `TIMEOUT`
-- Configurable number of magic-packet attempts
-- TCP-based reachability check after the WOL command
+Remote Wake-on-LAN can fail at different stages:
+
+- The remote client cannot connect to the broker.
+- The broker does not authorize a publish or subscription.
+- The ESP32 loses Wi-Fi or its MQTT connection.
+- The ESP32 receives an invalid command.
+- The local UDP send operation fails.
+- The magic packet does not reach the target network adapter.
+- The target's firmware, driver, or power state prevents wake-up.
+- The computer starts, but the configured verification service remains unavailable.
+
+The firmware reports separate stages rather than treating packet transmission as proof of a successful startup.
+
+```text
+RECEIVED -> SENT -> ONLINE
+```
+
+or:
+
+```text
+RECEIVED -> SENT -> TIMEOUT
+```
+
+## Features
+
+- Remote Wake-on-LAN through MQTT
+- TLS certificate validation using a configured root CA
+- JSON commands with command IDs
+- Limited duplicate-command detection
+- Structured JSON status and diagnostic messages
+- Repeated magic-packet transmission
+- TCP-based target-service reachability checks
 - Wi-Fi RSSI, uptime, firmware version, and MQTT state in telemetry
-- MQTT Last Will and Testament for offline detection
-- Automatic Wi-Fi and MQTT reconnection with exponential backoff
-- Re-subscription to the command topic after reconnecting
+- MQTT Last Will for unexpected connection loss
+- Reconnection logic and re-subscription after MQTT reconnect
 
-## Status chain
+Availability-topic separation and other reliability improvements must match the firmware version in use.
+See the limitations and roadmap below.
+
+## Status interpretation
 
 | Status | Meaning |
 |---|---|
-| `RECEIVED` | The ESP32 received and validated the MQTT command. |
-| `SENT` | The ESP32 sent at least one WOL magic packet locally. |
-| `ONLINE` | The target PC became reachable within the configured timeout. |
-| `TIMEOUT` | The target PC did not become reachable within the configured timeout. |
-| `FAILED` | The ESP32 could not complete the WOL process, for example because Wi-Fi was unavailable or UDP sending failed. |
-| `DUPLICATE_COMMAND` | A command with the same `cmd_id` was received while the previous process was still active. |
-| `INVALID_PAYLOAD` | The MQTT payload was missing required fields or contained an invalid action. |
-| `INVALID_TARGET` | The requested target is not configured on this ESP32. |
+| `RECEIVED` | An accepted command reached the ESP32 and passed validation. |
+| `SENT` | At least one local UDP send operation succeeded. |
+| `ONLINE` | The configured TCP service was reachable during the verification window. |
+| `TIMEOUT` | The configured TCP service was not detected before the deadline. |
+| `FAILED` | The wake process could not continue, for example because a local send operation failed. |
+| `DUPLICATE_COMMAND` | The firmware recognized a duplicate command within its current deduplication scope. |
+| `INVALID_PAYLOAD` | The command could not be parsed or failed payload validation. |
+| `INVALID_TARGET` | The requested target did not match the configured target. |
+
+`SENT` does not confirm that the target received or processed the magic packet.
+
+`ONLINE` confirms service reachability.
+It does not prove that this particular command caused the computer to start; the computer may already have been running.
+
+`TIMEOUT` does not necessarily mean that the computer remained powered off.
+The verification service may be stopped, blocked, or slow to start.
+
+## Configuration files
+
+The repository separates public firmware settings from private deployment settings.
+
+```text
+esp32_remote_wake_gateway/
+├── esp32_remote_wake_gateway.ino
+├── config.h
+├── secrets.example.h
+├── secrets.h
+├── .gitignore
+├── README.md
+└── LICENSE
+```
+
+| File | Purpose | Commit to Git? |
+|---|---|---|
+| `esp32_remote_wake_gateway.ino` | Firmware logic | Yes |
+| `config.h` | General firmware settings and timing | Yes |
+| `secrets.example.h` | Public template with example values | Yes |
+| `secrets.h` | Actual credentials and personal network settings | No |
+
+Copy the template:
+
+```bash
+cp secrets.example.h secrets.h
+```
+
+Replace the example values in `secrets.h` before building.
+
+### Personal settings
+
+| Variable | Purpose |
+|---|---|
+| `WIFI_SSID` | Wi-Fi network name |
+| `WIFI_PASSWORD` | Wi-Fi password |
+| `MQTT_HOST` | Broker hostname |
+| `MQTT_PORT` | Broker TLS port |
+| `MQTT_CLIENT_ID` | Unique MQTT client identifier |
+| `MQTT_USER` | ESP32 MQTT username |
+| `MQTT_PASSWORD` | ESP32 MQTT password |
+| `COMMAND_TOPIC` | Incoming wake-command topic |
+| `AVAILABILITY_TOPIC` | Device availability topic, when implemented |
+| `STATUS_TOPIC` | Per-command status topic |
+| `LOG_TOPIC` | Diagnostic log topic |
+| `TARGET_NAME` | Logical target name expected in the command |
+| `SERVER_MAC` | Target Ethernet adapter's MAC address |
+| `BROADCAST_IP` | Broadcast address used for local WOL transmission |
+| `TARGET_IP` | Target address used for verification |
+| `TARGET_CHECK_PORT` | TCP port checked after wake-up |
+| `ROOT_CA` | Public root CA certificate used to validate the broker |
+
+Example values in `secrets.example.h`:
+
+```cpp
+const char* COMMAND_TOPIC =
+    "example/home/esp32/wake";
+
+const char* AVAILABILITY_TOPIC =
+    "example/home/esp32/availability";
+
+const char* STATUS_TOPIC =
+    "example/home/esp32/status";
+
+const char* LOG_TOPIC =
+    "example/home/esp32/log";
+
+const char* TARGET_NAME = "example-server";
+const char* SERVER_MAC = "02:00:00:00:00:01";
+
+IPAddress BROADCAST_IP(192, 168, 50, 255);
+
+const char* TARGET_IP = "192.168.50.10";
+const uint16_t TARGET_CHECK_PORT = 22;
+```
+
+These are example values, not a ready-to-use network configuration.
+
+### General firmware settings
+
+The following settings can remain public in `config.h`:
+
+```text
+FIRMWARE_VERSION
+WOL_PORT
+WOL_ATTEMPTS
+WOL_ATTEMPT_DELAY_MS
+PC_CHECK_DELAY_MS
+PC_CHECK_TIMEOUT_MS
+PC_CHECK_INTERVAL_MS
+MQTT_RECONNECT_MIN_MS
+MQTT_RECONNECT_MAX_MS
+```
+
+### Choosing a verification port
+
+Set `TARGET_CHECK_PORT` to a TCP service that is actually reachable after startup.
+
+Examples include:
+
+- `22`: SSH, if enabled
+- `3389`: Remote Desktop, if enabled
+- `443`: HTTPS, if a service is running
+- `8006`: Proxmox web interface
+
+Do not open an unnecessary service solely to make the verification check pass.
 
 ## Example command
 
-Publish to:
+Publish to the value configured in `COMMAND_TOPIC`.
+
+With the example configuration:
 
 ```text
-carl/home/esp32/wake
+example/home/esp32/wake
 ```
 
 Payload:
 
 ```json
 {
-  "cmd_id": "wol-2026-10-20-001",
+  "cmd_id": "example-wake-001",
   "action": "WAKE",
-  "target": "proxmox-host"
+  "target": "example-server"
 }
 ```
 
-The ESP32 publishes status updates to:
+The `target` value must match `TARGET_NAME`.
 
-```text
-carl/home/esp32/status
-```
+Use a new command ID for each new wake request.
+Do not retain wake commands.
 
-Example:
+### Example feedback
+
+Subscribe to the configured `STATUS_TOPIC` and `LOG_TOPIC`.
+
+Example status event:
 
 ```json
 {
   "event": "wol_command",
-  "cmd_id": "wol-2026-10-20-001",
+  "cmd_id": "example-wake-001",
   "state": "SENT",
   "firmware": "1.1.0",
   "uptime_s": 4120,
@@ -177,10 +340,11 @@ Example:
 }
 ```
 
-After the configured delay, the ESP32 checks whether the target PC is reachable and publishes either:
+Selected fields from a subsequent result might be:
 
 ```json
 {
+  "cmd_id": "example-wake-001",
   "state": "ONLINE",
   "latency_ms": 18400
 }
@@ -190,170 +354,216 @@ or:
 
 ```json
 {
+  "cmd_id": "example-wake-001",
   "state": "TIMEOUT",
   "reason": "pc_not_reachable",
   "latency_ms": 60000
 }
 ```
 
-## Hardware
-
-This project is designed for a low-cost, always-on ESP32 board.
-
-The ESP32 is a small Wi-Fi and Bluetooth microcontroller with 520 KB of on-chip SRAM, a dual-core processor, and integrated 2.4 GHz Wi-Fi. It is intended for low-power IoT applications and does not require a full Linux operating system for this use case. [Espressif ESP32 documentation](https://www.espressif.com/en/products/socs/esp32)
-
-### Minimal hardware
-
-- ESP32 development board
-- USB power supply
-- Wi-Fi network
-- MQTT broker
-- Target PC with Wake-on-LAN enabled
-- Optional: enclosure and status LED
-
-The ESP32 does not need to be physically connected to the target PC. It only needs to remain powered and connected to the same local network as the target PC.
-
-## Why an ESP32-based gateway makes sense
-
-For this use case, the ESP32 is a deliberately minimal architecture:
-
-- It runs one focused task: receive a command, send a local WOL packet, report status.
-- It does not need a desktop operating system, large RAM, or a general-purpose Linux environment.
-- It can remain powered 24/7 at very low power consumption.
-- It avoids keeping a larger computer powered solely to relay WOL packets.
-- It can be placed close to the target network segment, which is important because WOL broadcasts are local Layer-2 traffic.
-
-A Raspberry Pi Zero 2 W, for example, provides 512 MB of RAM and a quad-core ARM processor, which is useful for general-purpose Linux workloads but more than necessary for a dedicated WOL relay. [Raspberry Pi Zero 2 W](https://www.raspberrypi.com/products/raspberry-pi-zero-2-w/)
-
-The ESP32 provides 520 KB of SRAM and integrated Wi-Fi, which is sufficient for MQTT, TLS, UDP, and a small telemetry buffer. [ESP32 datasheet](https://documentation.espressif.com/esp32_datasheet_en.pdf)
-
-This project does not claim that an ESP32 is universally better than a Raspberry Pi or another gateway. A Raspberry Pi is more capable for general-purpose services, containers, VPN routing, logging stacks, or applications that need Linux. For a single-purpose, low-cost, always-on WOL gateway, the ESP32 is a practical fit.
-
-## Configuration
-
-Create a `secrets.h` file:
-
-```cpp
-#pragma once
-
-const char* WIFI_SSID = "your-wifi-ssid";
-const char* WIFI_PASSWORD = "your-wifi-password";
-
-const char* MQTT_HOST = "your-mqtt-broker-host";
-const uint16_t MQTT_PORT = 8883;
-
-const char* MQTT_CLIENT_ID = "esp32-wol-gateway";
-const char* MQTT_USER = "esp32-wol";
-const char* MQTT_PASSWORD = "your-mqtt-password";
-```
-
-Add `secrets.h` to `.gitignore`. Do not commit Wi-Fi passwords, MQTT credentials, certificates, or internal IP addresses.
-
-### Main configuration
-
-```cpp
-const char* SERVER_MAC = "2C:F0:5D:05:0F:FB";
-IPAddress BROADCAST_IP(192, 168, 178, 255);
-const uint16_t WOL_PORT = 9;
-
-const char* TARGET_IP = "192.168.178.50";
-const uint16_t TARGET_CHECK_PORT = 22;
-```
-
-Set `TARGET_CHECK_PORT` to a TCP port that is actually open after the target PC starts. Common examples:
-
-- `22` for SSH
-- `3389` for Windows Remote Desktop
-- `80` or `443` for a local web service
-
-If no port is open, the ESP32 can report `SENT`, but it will not be able to report `ONLINE`.
+These examples illustrate the message structure.
+They are not measured reliability results.
 
 ## MQTT permissions
 
-Use separate permissions for the ESP32 and the MQTT client.
+Use separate credentials for the ESP32 and the remote MQTT client.
 
-### ESP32 user
+Configure permissions for the actual topic strings stored in `secrets.h`.
+The variable names themselves are not MQTT topics.
 
-| Action | Topic |
-|---|---|
-| Subscribe | `carl/home/esp32/wake` |
-| Publish | `carl/home/esp32/status` |
-| Publish | `carl/home/esp32/log` |
+### ESP32 account
 
-### Remote MQTT client
+| Action | Configured topic | Example |
+|---|---|---|
+| Subscribe | `COMMAND_TOPIC` | `example/home/esp32/wake` |
+| Publish | `STATUS_TOPIC` | `example/home/esp32/status` |
+| Publish | `LOG_TOPIC` | `example/home/esp32/log` |
+| Publish, if implemented | `AVAILABILITY_TOPIC` | `example/home/esp32/availability` |
 
-| Action | Topic |
-|---|---|
-| Publish | `carl/home/esp32/wake` |
-| Subscribe | `carl/home/esp32/status` |
-| Subscribe | `carl/home/esp32/log` |
+### Remote MQTT client account
 
-Keep permissions narrow. The remote client should not need broad wildcard access such as `#`.
+| Action | Configured topic | Example |
+|---|---|---|
+| Publish | `COMMAND_TOPIC` | `example/home/esp32/wake` |
+| Subscribe | `STATUS_TOPIC` | `example/home/esp32/status` |
+| Subscribe | `LOG_TOPIC` | `example/home/esp32/log` |
+| Subscribe, if implemented | `AVAILABILITY_TOPIC` | `example/home/esp32/availability` |
+
+Keep permissions narrow.
+Neither account needs unrestricted wildcard access.
+
+## Hardware and deployment requirements
+
+- Compatible ESP32 development board with Wi-Fi
+- Independent USB power supply
+- Working local Wi-Fi and internet access
+- Reachable MQTT broker with TLS
+- Target computer with a WOL-capable Ethernet adapter
+- Wired network connection for the target computer
+
+The ESP32 does not need a USB or mainboard connection to the target computer.
+Its role is to generate a local network packet.
+
+The power source must remain available when the target computer is shut down.
+Do not assume that a USB port on the target computer stays powered.
+
+## Cost-conscious architecture
+
+The relay uses a microcontroller instead of a dedicated general-purpose computer.
+
+For this implementation, the relay itself does not require:
+
+- A separate Linux host
+- Removable operating-system storage
+- Additional upgradeable system RAM
+- A continuously running gaming PC
+
+This is a deliberately narrow workload:
+receive a command, send a local packet, and report diagnostic information.
+
+The design avoids purchasing a general-purpose computer solely for this task.
+It also does not require additional system RAM for the relay.
+
+The project does not claim to be the cheapest possible WOL architecture.
+Actual costs depend on the board, power supply, existing equipment, broker plan, and local electricity price.
+
+### Energy objective
+
+The objective is to keep the small gateway available while allowing the larger computer to remain shut down when unused.
+
+Net energy savings depend on:
+
+- The target computer's powered-on consumption
+- Its shutdown or standby consumption
+- The gateway's measured consumption
+- How many hours the target computer remains off
+- Any additional equipment required by the deployment
+
+Power consumption, annual operating costs, and net savings have not yet been measured for this project.
 
 ## Installation
 
-1. Install the Arduino IDE or PlatformIO.
-2. Install the ESP32 board support package.
-3. Install the following Arduino libraries:
-   - `PubSubClient`
-   - `ArduinoJson`
-4. Create `secrets.h` with your Wi-Fi and MQTT credentials.
-5. Add your MQTT broker’s root CA certificate to `ROOT_CA`.
-6. Set the target MAC address, broadcast address, target IP, and reachability port.
-7. Flash the sketch to the ESP32.
-8. Subscribe to `carl/home/esp32/status` and `carl/home/esp32/log`.
-9. Publish a WOL command to `carl/home/esp32/wake`.
+1. Install the Arduino IDE and ESP32 board support package.
+2. Install `PubSubClient` and `ArduinoJson`.
+3. Copy `secrets.example.h` to `secrets.h`.
+4. Enter your Wi-Fi and MQTT settings.
+5. Configure the target name, MAC address, broadcast address, IP address, and verification port.
+6. Insert the complete root CA certificate required by your broker.
+7. Review the timing settings in `config.h`.
+8. Build and flash the firmware.
+9. Subscribe to the configured status and log topics.
+10. Publish a JSON command to `COMMAND_TOPIC`.
 
-## Target PC requirements
+The selected firmware revision must compile successfully before deployment.
+Known implementation issues should be resolved or documented in the repository.
 
-Wake-on-LAN must be enabled in several places:
+## Target computer requirements
 
-- BIOS/UEFI: enable WOL, “Wake by PCI-E”, “Power On by PCI-E”, or an equivalent option.
-- Operating system: enable WOL for the Ethernet adapter.
-- Network adapter driver: enable “Wake on Magic Packet”.
-- Ethernet connection: use a wired connection where possible.
-- Power state: test both shutdown and sleep/hibernate states.
+Wake-on-LAN support depends on the target hardware and software configuration.
 
-WOL behavior can vary significantly between motherboards, network adapters, operating systems, and power states.
+Check:
 
-## Reliability design
+- BIOS/UEFI WOL or equivalent PCIe wake settings
+- Operating-system and Ethernet-driver settings
+- Magic-packet wake support
+- Network-adapter power availability after shutdown
+- The specific sleep, hibernation, or shutdown state used in testing
 
-The firmware uses the following mechanisms:
+Use a stable target IP assignment for the TCP verification check.
 
-- MQTT QoS 1 for command subscription and status publishing.
-- MQTT Last Will and Testament to report an unexpected offline state.
-- Repeated magic-packet transmission.
-- TCP reachability checks after the WOL command.
-- Exponential MQTT reconnect backoff.
-- Automatic re-subscription after reconnecting.
-- Structured telemetry including Wi-Fi RSSI, uptime, firmware version, and MQTT state.
+Test local WOL before testing the complete remote MQTT workflow.
 
-A successful WOL result is therefore not defined as “the ESP32 sent a packet”, but as:
+## Reliability and delivery semantics
 
-```text
-Command received -> packet sent -> target PC reachable
-```
+The current PubSubClient-based implementation:
 
-## Limitations
+- Can request a QoS 1 command subscription
+- Publishes normal status and log messages at QoS 0
+- Does not provide broker acknowledgements for those outgoing QoS 0 messages
+- Uses repeated local WOL packet transmission
+- Checks target-service reachability after sending
+- Attempts reconnection and re-subscription after connection loss
 
-- The ESP32 cannot confirm that a powered-off PC received the UDP magic packet.
-- `ONLINE` is based on a TCP reachability check, not on direct hardware-level confirmation from the target PC.
-- WOL broadcasts should remain within the same Layer-2 network as the target PC.
-- Wi-Fi-based ESP32 operation depends on the stability of the wireless network.
-- The target PC’s BIOS/UEFI, network adapter, driver, and power state can still prevent WOL from working.
-- This project is intended for private or lab environments. Do not expose MQTT credentials, broker ports, or WOL control topics directly to the public internet.
+An accepted subscription request does not by itself prove that the broker authorized the subscription.
+
+A successful `publish()` return value is not an end-to-end acknowledgement from the remote user.
+
+An MQTT command arriving successfully does not prove that the computer will wake.
+
+## Known limitations
+
+- The current implementation is not production-ready.
+- Reconnect routines can block other firmware work.
+- Duplicate-command protection is limited and does not survive a restart.
+- Handling of overlapping commands needs further hardening.
+- Diagnostic messages can be lost during connectivity failures.
+- There is no persistent offline event buffer.
+- TCP connection timeouts and UDP result checks require careful implementation.
+- A broker connection shown as online does not prove that the command subscription works.
+- `ONLINE` indicates a reachable TCP service, not hardware-level power-state confirmation.
+- `TIMEOUT` is not a definitive diagnosis of the underlying failure.
+- A single ESP32, access point, power supply, internet connection, or broker can remain a single point of failure.
+
+## Security and privacy
+
+- Keep `secrets.h` out of version control.
+- Do not publish real Wi-Fi or MQTT passwords.
+- Public root CA certificates may be included; private keys must not be published.
+- Do not disable TLS certificate validation.
+- Use separate MQTT accounts with minimal topic permissions.
+- Do not retain wake commands.
+- Do not expose an anonymous or unauthenticated MQTT broker.
+- A publicly reachable cloud MQTT endpoint is expected in this architecture, but it must use appropriate authentication, authorization, and TLS.
+- Avoid publishing personal network details in screenshots, logs, diagrams, or examples.
+- Compiled firmware may contain embedded credentials.
+- Rotate credentials if they have been exposed.
+
+## Reliability testing
+
+Test the system under documented, repeatable conditions.
+
+| Scenario | Expected observation |
+|---|---|
+| Valid command with target shut down | `RECEIVED`, `SENT`, then `ONLINE` or `TIMEOUT` |
+| Target already running | Reachability detected; no claim that a boot occurred |
+| Invalid target name | `INVALID_TARGET` |
+| Invalid JSON | `INVALID_PAYLOAD` |
+| Repeated command ID during an active request | Duplicate detected within the implemented scope |
+| Wi-Fi interruption | Recovery without reflashing, after connectivity returns |
+| Broker interruption | MQTT reconnect and subscription restoration |
+| Target verification service unavailable | `TIMEOUT`, even if the computer is powered on |
+
+Record:
+
+- Firmware and dependency versions
+- Board and target hardware
+- Target power state
+- Network conditions
+- Command ID
+- Observed events
+- Number of trials
+- Time to service reachability
+
+Publish measured results separately from design goals.
 
 ## Roadmap
 
-- [ ] Persistent offline telemetry buffer using NVS or LittleFS
-- [ ] Watchdog timer
+- [ ] Non-blocking reconnect scheduling
+- [ ] Dedicated availability topic
+- [ ] Stronger duplicate-command and busy-state handling
+- [ ] Explicit network-operation timeouts
+- [ ] Persistent or bounded offline telemetry buffering
 - [ ] Reset-reason reporting
-- [ ] Local physical WOL button
-- [ ] Status LED
-- [ ] OTA firmware updates
-- [ ] Multiple configurable target PCs
-- [ ] Reliability test matrix and CSV export
+- [ ] Automated compilation checks
+- [ ] Documented long-running reliability tests
+- [ ] Measured gateway power consumption and operating costs
+
+## Scope
+
+This is a standalone remote wake-up and reliability project.
+
+Network intrusion detection, machine learning, and unrelated homelab infrastructure are outside its scope.
 
 ## License
 
-Choose and add a license before publishing, for example MIT or Apache-2.0.
+Add the selected license to the repository before distributing the project under that license.
