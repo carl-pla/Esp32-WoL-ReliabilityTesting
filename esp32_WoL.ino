@@ -5,34 +5,9 @@
 #include <PubSubClient.h>
 #include <WiFiUdp.h>
 #include <ArduinoJson.h>
+
 #include "secrets.h"
-
-// =========================
-// VERSION / KONFIGURATION
-// =========================
-
-const char* FIRMWARE_VERSION = "1.1.0";
-
-const char* SERVER_MAC = "2C:F0:5D:05:0F:FB";
-IPAddress BROADCAST_IP(192, 168, 178, 255);
-const uint16_t WOL_PORT = 9;
-
-const char* TARGET_IP = "192.168.178.50"; // IP des Ziel-PCs
-const uint16_t TARGET_CHECK_PORT = 22;    // SSH; bei Windows z. B. 3389 oder anderer offener Port
-
-const char* COMMAND_TOPIC = "carl/home/esp32/wake";
-const char* STATUS_TOPIC  = "carl/home/esp32/status";
-const char* LOG_TOPIC     = "carl/home/esp32/log";
-
-const uint8_t WOL_ATTEMPTS = 3;
-const uint16_t WOL_ATTEMPT_DELAY_MS = 250;
-
-const unsigned long PC_CHECK_DELAY_MS = 15000;
-const unsigned long PC_CHECK_TIMEOUT_MS = 60000;
-const unsigned long PC_CHECK_INTERVAL_MS = 3000;
-
-const unsigned long MQTT_RECONNECT_MIN_MS = 2000;
-const unsigned long MQTT_RECONNECT_MAX_MS = 60000;
+#include "config.h"
 
 
 // =========================

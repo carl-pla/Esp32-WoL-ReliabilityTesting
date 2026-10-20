@@ -1,1 +1,14 @@
+# Private configuration
 secrets.h
+
+# Firmware binaries may contain compiled-in credentials
+*.bin
+*.elf
+
+# Build directories
+.pio/
+build/
+
+# Local OS files
+.DS_Store
+Thumbs.db

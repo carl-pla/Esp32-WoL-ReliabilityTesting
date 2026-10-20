@@ -31,29 +31,84 @@ RECEIVED -> SENT -> TIMEOUT
 
 ## How it works
 
-```text
-MQTT client
-    |
-    | MQTT command
-    v
-MQTT broker
-    |
-    | MQTT message
-    v
-ESP32 gateway
-    |
-    | local UDP magic packet
-    v
-Target PC
-    |
-    | TCP reachability check
-    v
-MQTT status feedback
+```mermaid
+flowchart LR
+    subgraph REMOTE["Remote device"]
+        CLIENT["MacBook / iPhone<br/>MQTT client"]
+    end
+
+    subgraph CLOUD["Reachable MQTT service"]
+        BROKER["MQTT broker<br/>Example: EMQX Cloud<br/>or another compatible broker"]
+    end
+
+    subgraph HOME["Home network"]
+        ESP["ESP32 Wake Gateway<br/>Always-on · Wi-Fi<br/>Independent power supply"]
+        SERVER["Target server / PC<br/>Ethernet connection<br/>Wake-on-LAN enabled"]
+    end
+
+    CLIENT -->|"Publish wake command<br/>MQTT over TLS"| BROKER
+    BROKER -->|"Deliver subscribed command"| ESP
+
+    ESP -->|"Local UDP broadcast<br/>102-byte magic packet"| SERVER
+    ESP -.->|"Check configured TCP service<br/>after wake"| SERVER
+
+    ESP -->|"Publish status and logs"| BROKER
+    BROKER -->|"Deliver subscribed feedback"| CLIENT
+
+    CLIENT -.->|"Optional Tailscale access<br/>after server startup"| SERVER
+
+    classDef device fill:#6699ee,stroke:#365e9d,stroke-width:2px,color:#10213b;
+    classDef broker fill:#ffa34d,stroke:#b86516,stroke-width:2px,color:#33200e;
+
+    class CLIENT,ESP,SERVER device;
+    class BROKER broker;
+
+    style REMOTE fill:#eaf2ff,stroke:#6699ee,stroke-width:2px,color:#10213b
+    style CLOUD fill:#fff0de,stroke:#ffa34d,stroke-width:2px,color:#33200e
+    style HOME fill:#fff4af,stroke:#c7a900,stroke-width:2px,color:#332d0b
+
+    linkStyle 0,1 stroke:#b86516,stroke-width:2px;
+    linkStyle 2 stroke:#365e9d,stroke-width:3px;
+    linkStyle 3 stroke:#62748c,stroke-width:2px;
+    linkStyle 4,5 stroke:#228453,stroke-width:2px;
+    linkStyle 6 stroke:#8250c4,stroke-width:2px;
 ```
 
-The ESP32 stays powered on and connected to the local network. It subscribes to a command topic, validates incoming messages, sends one or more WOL magic packets locally, and publishes status messages back to the broker.
+The ESP32 initiates and maintains an outbound connection to the MQTT broker.
+The broker forwards commands over that existing connection.
 
-Tailscale or another VPN can be used separately to access the target PC after it has started. The WOL command itself does not need to travel through the VPN tunnel; it only needs to reach the MQTT broker.
+EMQX Cloud is the reference broker used in this project, not a required dependency.
+Another MQTT broker can be used if it supports the firmware's MQTT version,
+TLS connection settings, authentication, and required topic permissions.
+
+Provider-specific authentication mechanisms may require firmware changes.
+
+Tailscale is optional and separate from the wake-command path.
+When both MQTT clients can reach the broker, waking the server does not require
+a VPN connection.
+
+The target server is not required to be running for the ESP32 to receive a
+wake command. The ESP32, its power supply, network infrastructure, and MQTT
+broker must remain available.
+
+
+### Status interpretation
+
+- `RECEIVED`: The command reached the ESP32 and passed validation.
+- `SENT`: At least one local UDP send operation succeeded.
+- `ONLINE`: The configured TCP service was reachable during the verification window.
+- `TIMEOUT`: The configured TCP service was not detected before the deadline.
+
+`SENT` does not confirm that the target received the magic packet.
+`ONLINE` confirms service reachability, not necessarily that this command caused the server to start.
+
+### Network boundaries
+
+- The ESP32 and the target server share the local network used for the WOL broadcast.
+- The ESP32 remains independently powered while the server is shut down.
+- Tailscale is a separate access path for use after the server starts.
+- The MQTT wake workflow does not require Tailscale when both clients can reach the broker.
+- The server's internal VMs, VLANs, and sandbox firewall are outside the scope of this diagram.
 
 ## Key features
 
