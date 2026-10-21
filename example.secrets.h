@@ -74,6 +74,9 @@ const char* STATUS_TOPIC =
 const char* LOG_TOPIC =
     "example/home/esp32/log";
 
+const char* AVAILABILITY_TOPIC =
+    "example/home/esp32/availability";
+
 // ============================================================
 // TARGET DEVICE
 // ============================================================
@@ -82,6 +85,8 @@ const char* LOG_TOPIC =
 // MAC address of the target's Wake-on-LAN-capable Ethernet adapter.
 // This is an example value. Replace it with the actual MAC.
 const char* SERVER_MAC = "02:00:00:00:00:01";
+const char* TARGET_NAME = "example-server"
+
 
 // Broadcast address of the target's local network.
 // This example assumes the subnet 192.168.50.0/24.
