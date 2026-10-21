@@ -111,15 +111,9 @@ The target computer is not required to run an MQTT client.
 
 ### Local wake-up
 
-The ESP32 validates the received command and constructs a Wake-on-LAN
-magic packet containing the configured target MAC address.
+The firmware derives the local subnet broadcast address from the ESP32's current Wi-Fi configuration using `WiFi.broadcastIP()` and sends the Wake-on-LAN magic packet over UDP to `WOL_PORT` (default: 9).
 
-The packet is sent as a local UDP broadcast using the configured
-`BROADCAST_IP` and `WOL_PORT`.
-
-The ESP32 and the target network adapter must share the broadcast domain
-used for this transmission. Client isolation or broadcast filtering can
-prevent delivery even when both devices have internet access.
+The ESP32 and target network adapter must share the broadcast domain used for this transmission. Client isolation, VLAN separation, or broadcast filtering can prevent delivery even when both devices have internet access.
 
 ### Feedback and verification
 
@@ -197,15 +191,13 @@ provider. Do not copy example values unchanged and expect them to work.
 2.  Install the `PubSubClient` and `ArduinoJson` libraries.
 3.  Copy `secrets.example.h` to `secrets.h`.
 4.  Add your Wi-Fi credentials and MQTT broker settings to `secrets.h`.
-5.  Configure the target computer's MAC address, local broadcast
-    address, target IP, and TCP verification port.
-6.  Add the root CA certificate needed to validate your broker's TLS
-    certificate.
-7.  Review the timing and retry settings in `config.h`.
-8.  Build the firmware and flash it to the ESP32.
-9.  Use an MQTT client to subscribe to the configured status and log
-    topics.
-10. Publish a wake command to the configured command topic.
+5. Configure the target computer's MAC address, target name, local IP address, and TCP verification port in `secrets.h`.
+6. Add the root CA certificate required to validate the MQTT broker's TLS certificate.
+7. Review the timing and retry settings in `config.h`.
+8. Ensure the ESP32 can reach an NTP server. The firmware synchronizes its clock using SNTP before attempting the MQTT TLS connection.
+9. Build the firmware and flash it to the ESP32.
+10. Use an MQTT client to subscribe to the configured status and log topics.
+11. Publish a wake command to the configured command topic.
 
 Before testing the full remote workflow, confirm that Wake-on-LAN works
 locally and that the target computer's BIOS/UEFI, operating system, and
@@ -314,26 +306,16 @@ the internet just to make the check pass.
 
 ## MQTT access and security
 
-Use separate MQTT credentials for the ESP32 and the remote client, with
-only the topic permissions each needs.
+Use separate MQTT credentials for the ESP32 and the remote client, with only the topic permissions each needs.
 
-  -----------------------------------------------------------------------
-  Client                              Permissions needed
-  ----------------------------------- -----------------------------------
-  ESP32                               Subscribe to the command topic;
-                                      publish status and log topics
+| Client | Required permissions |
+|---|---|
+| ESP32 | Subscribe to the command topic; publish to the status, log, and availability topics |
+| Remote MQTT client | Publish to the command topic; subscribe to the status, log, and availability topics |
 
-  Remote MQTT client                  Publish to the command topic;
-                                      subscribe to status and log topics
-  -----------------------------------------------------------------------
+The ESP32 uses QoS 1 when subscribing to the command topic. Outgoing status, log, and availability messages use QoS 0 through `PubSubClient`. The firmware also publishes retained status and availability messages; wake commands should not be retained.
 
-Use the actual topic names configured in your files. Keep permissions
-narrow, do not use an anonymous broker, do not disable TLS certificate
-validation, and avoid retaining wake commands.
-
-The MQTT broker must be reachable independently of the computer being
-woken. Running the only broker on that target computer would create a
-circular dependency.
+Use the actual topic names configured in `secrets.h`. Keep permissions narrow, retain TLS certificate validation, and avoid anonymous broker access.
 
 ## Testing and results
 
@@ -353,17 +335,10 @@ results separate from expected behaviour.
 
 ## Known limitations
 
--   Reconnection routines may block other firmware work.
--   Duplicate-command protection is limited and does not persist across
-    restarts.
--   Overlapping commands need further hardening.
--   A connected MQTT client does not by itself prove that command
-    subscription permissions are correct.
--   A successful MQTT publish call is not an end-to-end acknowledgement
-    that a remote user received the status.
--   `ONLINE` means a configured TCP service responded, not that hardware
-    power state was independently confirmed.
--   `TIMEOUT` does not identify the root cause of a failed check.
+- MQTT reconnection and other network operations may still affect responsiveness.
+- Duplicate-command protection is limited to the firmware's current in-memory state and does not persist across restarts.
+- A single additional command can be queued while a wake process is running. Further commands may be rejected, and command handling has not yet been validated under sustained load.
+- The TCP reachability check verifies a configured service, not the computer's physical power state. `TIMEOUT` means the service was not detected before the deadline; it does not identify the root cause.
 
 
 ## Remote access is separate
