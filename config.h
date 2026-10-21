@@ -2,47 +2,28 @@
 
 #include <Arduino.h>
 
-// ============================================================
-// FIRMWARE
-// ============================================================
+// Firmware version.
+const char* FIRMWARE_VERSION = "1.2.0";
 
-// Update this value when publishing a new firmware version.
-// The version number alone does not indicate production readiness.
-const char* FIRMWARE_VERSION = "1.1.0";
-
-// ============================================================
-// WAKE-ON-LAN TRANSMISSION
-// ============================================================
-
-// Destination UDP port for the magic packet.
+// Wake-on-LAN transmission.
 const uint16_t WOL_PORT = 9;
-
-// Number of magic-packet send attempts per accepted command.
 const uint8_t WOL_ATTEMPTS = 3;
+// Spread packets out so delayed/buffered broadcasts still get retries.
+const uint16_t WOL_ATTEMPT_DELAY_MS = 1500;
 
-// Delay between send attempts, in milliseconds.
-const uint16_t WOL_ATTEMPT_DELAY_MS = 250;
-
-// ============================================================
-// TARGET REACHABILITY CHECK
-// ============================================================
-
-// Delay before starting target-service checks.
+// Target reachability verification.
 const unsigned long PC_CHECK_DELAY_MS = 15000UL;
-
-// Overall verification deadline measured from command start.
-// This includes the initial delay above.
 const unsigned long PC_CHECK_TIMEOUT_MS = 60000UL;
-
-// Interval between target-service checks.
 const unsigned long PC_CHECK_INTERVAL_MS = 3000UL;
+const unsigned long TCP_CONNECT_TIMEOUT_MS = 1200UL;
 
-// ============================================================
-// MQTT RECONNECT
-// ============================================================
+// Command abuse protection and one-entry queue.
+const unsigned long COMMAND_COOLDOWN_MS = 10000UL;
 
-// Initial interval between MQTT reconnect attempts.
+// Wi-Fi / SNTP.
+const unsigned long SNTP_SYNC_TIMEOUT_MS = 20000UL;
+const unsigned long SNTP_RETRY_INTERVAL_MS = 60000UL;
+
+// MQTT reconnect backoff.
 const unsigned long MQTT_RECONNECT_MIN_MS = 2000UL;
-
-// Maximum interval for exponential reconnect backoff.
 const unsigned long MQTT_RECONNECT_MAX_MS = 60000UL;

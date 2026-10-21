@@ -3,378 +3,358 @@
 #include <PubSubClient.h>
 #include <WiFiUdp.h>
 #include <ArduinoJson.h>
+#include <time.h>
 #include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <lwip/sockets.h>
+#include <lwip/inet.h>
 
 #include "secrets.h"
 #include "config.h"
 
-
-// =========================
-// OBJECTS
-// =========================
+// ============================================================
+// OBJECTS AND STATE
+// ============================================================
 
 WiFiClientSecure tlsClient;
 PubSubClient mqtt(tlsClient);
 WiFiUDP udp;
 
 byte targetMac[6];
+bool udpReady = false;
 
-String activeCmdId = "";
-String lastCmdId = "";
+String activeCmdId;
+String lastCmdId;
+String queuedCmdId;
+bool commandQueued = false;
 
-enum WolState {
-  IDLE,
-  WAITING_PC,
-  FINISHED
-};
-
+// A small, one-command queue avoids silently discarding a command
+// while a previous wake verification is running.
+enum WolState { IDLE, WAITING_PC };
 WolState wolState = IDLE;
 
 unsigned long wolStartMs = 0;
 unsigned long lastPcCheckMs = 0;
+unsigned long lastWolSendMs = 0;
+unsigned long lastCommandStartMs = 0;
+uint8_t wolAttemptsSent = 0;
+
 unsigned long lastMqttReconnectAttempt = 0;
 unsigned long currentMqttBackoffMs = MQTT_RECONNECT_MIN_MS;
 
-// Additional state for non-blocking Wi-Fi connection management.
 bool wifiConnecting = false;
 bool wifiWasConnected = false;
 unsigned long wifiConnectStartMs = 0;
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 20000UL;
 
-const unsigned long WIFI_CONNECT_TIMEOUT_MS = 20000;
-const unsigned long TCP_CONNECT_TIMEOUT_MS = 1000;
+bool sntpStarted = false;
+bool clockIsValid = false;
+unsigned long sntpStartMs = 0;
+unsigned long lastSntpRetryMs = 0;
 
-// Tracks whether the UDP socket was initialized successfully.
-bool udpReady = false;
+// Non-blocking TCP reachability probe state.
+int reachabilitySocket = -1;
+bool tcpProbePending = false;
+unsigned long tcpProbeStartMs = 0;
 
+enum ProbeResult { PROBE_PENDING, PROBE_REACHABLE, PROBE_UNREACHABLE };
 
-// =========================
-// HELPER
-// =========================
+// ============================================================
+// HELPERS
+// ============================================================
 
 bool parseMac(const char* mac, byte out[6]) {
-  // Reject null pointers and malformed MAC addresses.
-  if (mac == nullptr) {
-    return false;
-  }
+  if (mac == nullptr) return false;
 
   unsigned int values[6];
   int consumed = 0;
+  int parsed = sscanf(mac, "%2x:%2x:%2x:%2x:%2x:%2x%n",
+                       &values[0], &values[1], &values[2],
+                       &values[3], &values[4], &values[5], &consumed);
+  if (parsed != 6 || mac[consumed] != '\0') return false;
 
-  int parsed = sscanf(
-    mac,
-    "%2x:%2x:%2x:%2x:%2x:%2x%n",
-    &values[0], &values[1], &values[2],
-    &values[3], &values[4], &values[5],
-    &consumed
-  );
-
-  // Require exactly six bytes and no trailing characters.
-  if (parsed != 6 || mac[consumed] != '\0') {
-    return false;
-  }
-
+  bool allZero = true;
+  bool allBroadcast = true;
   for (int i = 0; i < 6; i++) {
-    if (values[i] > 0xFF) {
-      return false;
-    }
-
+    if (values[i] > 0xFF) return false;
     out[i] = static_cast<byte>(values[i]);
+    if (out[i] != 0x00) allZero = false;
+    if (out[i] != 0xFF) allBroadcast = false;
   }
 
+  // Reject invalid, broadcast, and multicast destination MACs.
+  if (allZero || allBroadcast || (out[0] & 0x01)) return false;
   return true;
 }
 
-
-String buildJson(
-  const char* event,
-  const char* state,
-  const char* reason = "",
-  int attempts = 0,
-  long latencyMs = -1
-) {
+String buildJson(const char* event, const char* state,
+                 const char* reason = "", int attempts = 0,
+                 long latencyMs = -1) {
   JsonDocument doc;
-
   doc["event"] = event;
   doc["cmd_id"] = activeCmdId;
   doc["state"] = state;
   doc["firmware"] = FIRMWARE_VERSION;
   doc["uptime_s"] = millis() / 1000;
-  doc["wifi_rssi"] = WiFi.status() == WL_CONNECTED
-                       ? WiFi.RSSI()
-                       : 0;
-  doc["wifi_state"] = WiFi.status();
+  doc["wifi_rssi"] = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
+  doc["wifi_state"] = static_cast<int>(WiFi.status());
   doc["mqtt_connected"] = mqtt.connected();
 
-  if (strlen(reason) > 0) {
-    doc["reason"] = reason;
-  }
-
-  if (attempts > 0) {
-    doc["attempts"] = attempts;
-  }
-
-  if (latencyMs >= 0) {
-    doc["latency_ms"] = latencyMs;
-  }
+  if (reason != nullptr && reason[0] != '\0') doc["reason"] = reason;
+  if (attempts > 0) doc["attempts"] = attempts;
+  if (latencyMs >= 0) doc["latency_ms"] = latencyMs;
 
   String output;
   serializeJson(doc, output);
-
   return output;
 }
 
+bool publishJson(const char* topic, const String& json, bool retain = false) {
+  Serial.printf("[MQTT OUT] topic=%s payload=%s\n", topic, json.c_str());
+  if (!mqtt.connected()) return false;
 
-bool publishJson(
-  const char* topic,
-  const String& json,
-  bool retain = false
-) {
-  // Always print the message locally, even if MQTT is unavailable.
-  Serial.println(json);
-
-  if (!mqtt.connected()) {
-    return false;
-  }
-
-  // Report whether the MQTT library accepted the publication.
-  return mqtt.publish(topic, json.c_str(), retain);
+  // PubSubClient only supports QoS 0 for outgoing publish calls.
+  // Broker ACLs must explicitly allow this ESP32 to publish here.
+  bool ok = mqtt.publish(topic, json.c_str(), retain);
+  if (!ok) Serial.printf("[MQTT] Publish failed (topic=%s, state=%d)\n", topic, mqtt.state());
+  return ok;
 }
 
-
-void mqttLog(
-  const char* event,
-  const char* state,
-  const char* reason = ""
-) {
-  publishJson(LOG_TOPIC, buildJson(event, state, reason));
+void mqttLog(const char* event, const char* state, const char* reason = "") {
+  publishJson(LOG_TOPIC, buildJson(event, state, reason), false);
 }
 
-
-void publishWolStatus(
-  const char* state,
-  const char* reason = "",
-  int attempts = 0,
-  long latencyMs = -1
-) {
-  // Retained status allows clients to read the latest reported state.
-  publishJson(
-    STATUS_TOPIC,
-    buildJson("wol_command", state, reason, attempts, latencyMs),
-    true
-  );
+void publishWolStatus(const char* state, const char* reason = "",
+                      int attempts = 0, long latencyMs = -1) {
+  publishJson(STATUS_TOPIC, buildJson("wol_command", state, reason, attempts, latencyMs), true);
 }
 
+void closeTcpProbe() {
+  if (reachabilitySocket >= 0) close(reachabilitySocket);
+  reachabilitySocket = -1;
+  tcpProbePending = false;
+}
 
-// =========================
+void finishWolProcess(const char* state, const char* reason = "") {
+  publishWolStatus(state, reason, wolAttemptsSent,
+                   static_cast<long>(millis() - wolStartMs));
+  closeTcpProbe();
+  wolState = IDLE;
+  activeCmdId = ""; // Clear only after the final status has used the active ID.
+}
+
+// ============================================================
 // WAKE-ON-LAN
-// =========================
+// ============================================================
 
 bool sendMagicPacket() {
+  if (!udpReady || WiFi.status() != WL_CONNECTED) return false;
+
   byte packet[102];
-
-  // The first six bytes contain the synchronization pattern.
   memset(packet, 0xFF, 6);
+  for (int i = 0; i < 16; i++) memcpy(packet + 6 + i * 6, targetMac, 6);
 
-  // Append the target MAC address sixteen times.
-  for (int i = 0; i < 16; i++) {
-    memcpy(packet + 6 + i * 6, targetMac, 6);
-  }
-
-  // Reuse the initialized UDP socket for repeated transmissions.
-  if (!udpReady) {
-    return false;
-  }
-
-  if (!udp.beginPacket(BROADCAST_IP, WOL_PORT)) {
-    return false;
-  }
-
+  // Derive the subnet broadcast address from the current Wi-Fi config.
+  IPAddress broadcast = WiFi.broadcastIP();
+  if (!udp.beginPacket(broadcast, WOL_PORT)) return false;
   if (udp.write(packet, sizeof(packet)) != sizeof(packet)) {
     udp.endPacket();
     return false;
   }
-
-  // A successful send does not prove that the target received the packet.
-  return udp.endPacket();
+  return udp.endPacket() == 1;
 }
 
-
-bool sendMagicPackets() {
-  int successful = 0;
-
-  for (uint8_t i = 1; i <= WOL_ATTEMPTS; i++) {
-    if (sendMagicPacket()) {
-      successful++;
-    }
-
-    // Do not block the ESP32 for a long time between attempts.
-    // The main loop will schedule the next attempt instead.
-    if (i < WOL_ATTEMPTS) {
-      // Repeated sends are handled by the dedicated scheduler below.
-      // This function sends the first packet; see startWolProcess().
-      break;
-    }
-  }
-
-  return successful > 0;
-}
-
-
-// Tracks scheduled Magic Packet retransmissions.
-uint8_t wolAttemptsSent = 0;
-unsigned long lastWolSendMs = 0;
-
-
-// Send packets over multiple loop iterations instead of using delay().
 void sendScheduledWolPackets() {
-  if (wolState != WAITING_PC) {
-    return;
-  }
+  if (wolState != WAITING_PC || wolAttemptsSent >= WOL_ATTEMPTS) return;
+  if (millis() - lastWolSendMs < WOL_ATTEMPT_DELAY_MS) return;
 
-  if (wolAttemptsSent >= WOL_ATTEMPTS) {
-    return;
-  }
-
-  if (millis() - lastWolSendMs < WOL_ATTEMPT_DELAY_MS) {
-    return;
-  }
-
-  if (sendMagicPacket()) {
-    wolAttemptsSent++;
-  } else {
-    mqttLog("wol_command", "UDP_SEND_FAILED");
-    // Count failed transmissions too, to prevent endless retries.
-    wolAttemptsSent++;
-  }
-
+  wolAttemptsSent++; // Count attempts even if the local UDP send fails.
+  bool sent = sendMagicPacket();
   lastWolSendMs = millis();
+
+  if (sent) {
+    mqttLog("wol_packet", "SENT", "scheduled_attempt");
+  } else {
+    mqttLog("wol_packet", "UDP_SEND_FAILED", "scheduled_attempt");
+  }
 }
 
+// ============================================================
+// NON-BLOCKING TCP REACHABILITY PROBE
+// ============================================================
 
-bool isPcReachable() {
-  WiFiClient client;
+ProbeResult pollTcpProbe() {
+  if (!tcpProbePending || reachabilitySocket < 0) return PROBE_UNREACHABLE;
 
-  // Limit the time spent waiting for a TCP connection.
-  bool connected = client.connect(
-    TARGET_IP,
-    TARGET_CHECK_PORT,
-    TCP_CONNECT_TIMEOUT_MS
-  );
+  fd_set writeSet;
+  FD_ZERO(&writeSet);
+  FD_SET(reachabilitySocket, &writeSet);
+  timeval timeout = {0, 0};
+  int selected = select(reachabilitySocket + 1, nullptr, &writeSet, nullptr, &timeout);
 
-  if (connected) {
-    client.stop();
+  if (selected > 0 && FD_ISSET(reachabilitySocket, &writeSet)) {
+    int socketError = 0;
+    socklen_t errorLength = sizeof(socketError);
+    if (getsockopt(reachabilitySocket, SOL_SOCKET, SO_ERROR,
+                   &socketError, &errorLength) == 0 && socketError == 0) {
+      closeTcpProbe();
+      return PROBE_REACHABLE;
+    }
+    closeTcpProbe();
+    return PROBE_UNREACHABLE;
   }
 
-  return connected;
+  if (millis() - tcpProbeStartMs >= TCP_CONNECT_TIMEOUT_MS) {
+    closeTcpProbe();
+    return PROBE_UNREACHABLE;
+  }
+  return PROBE_PENDING;
 }
 
+bool startTcpProbe() {
+  closeTcpProbe();
 
-// =========================
-// WOL PROCESS
-// =========================
+  sockaddr_in address = {};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(TARGET_CHECK_PORT);
+  if (inet_aton(TARGET_IP, &address.sin_addr) == 0) {
+    mqttLog("reachability", "CONFIG_ERROR", "invalid_target_ip");
+    return false;
+  }
+
+  int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (sock < 0) {
+    mqttLog("reachability", "SOCKET_ERROR", "socket_create_failed");
+    return false;
+  }
+
+  int flags = fcntl(sock, F_GETFL, 0);
+  if (flags < 0 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) {
+    close(sock);
+    mqttLog("reachability", "SOCKET_ERROR", "nonblocking_setup_failed");
+    return false;
+  }
+
+  int result = connect(sock, reinterpret_cast<sockaddr*>(&address), sizeof(address));
+  if (result == 0) {
+    close(sock);
+    // Immediate success is rare but valid.
+    return true;
+  }
+
+  if (errno != EINPROGRESS && errno != EWOULDBLOCK) {
+    close(sock);
+    return false;
+  }
+
+  reachabilitySocket = sock;
+  tcpProbePending = true;
+  tcpProbeStartMs = millis();
+  return false;
+}
+
+void checkWolProcess() {
+  if (wolState != WAITING_PC) return;
+
+  unsigned long elapsed = millis() - wolStartMs;
+  if (elapsed >= PC_CHECK_TIMEOUT_MS) {
+    finishWolProcess("TIMEOUT", "target_service_not_reachable_before_deadline");
+    return;
+  }
+
+  if (elapsed < PC_CHECK_DELAY_MS) return;
+
+  if (tcpProbePending) {
+    ProbeResult result = pollTcpProbe();
+    if (result == PROBE_REACHABLE) {
+      finishWolProcess("ONLINE", "target_service_reachable");
+      return;
+    }
+    if (result == PROBE_PENDING) return;
+    // A failed connection attempt is not a diagnosis; try again at the interval.
+  }
+
+  if (millis() - lastPcCheckMs < PC_CHECK_INTERVAL_MS) return;
+  lastPcCheckMs = millis();
+  bool connectedImmediately = startTcpProbe();
+  if (connectedImmediately) finishWolProcess("ONLINE", "target_service_reachable");
+}
+
+// ============================================================
+// COMMAND QUEUE AND RATE LIMIT
+// ============================================================
 
 void startWolProcess(const String& cmdId) {
   activeCmdId = cmdId;
   lastCmdId = cmdId;
-
+  lastCommandStartMs = millis();
   wolStartMs = millis();
   lastPcCheckMs = 0;
-  lastWolSendMs = 0;
+  lastWolSendMs = millis();
   wolAttemptsSent = 0;
-
   wolState = WAITING_PC;
+  closeTcpProbe();
 
   publishWolStatus("RECEIVED");
 
   if (WiFi.status() != WL_CONNECTED) {
-    publishWolStatus("FAILED", "wifi_disconnected");
-    wolState = FINISHED;
+    finishWolProcess("FAILED", "wifi_disconnected");
+    return;
+  }
+  if (!udpReady) {
+    finishWolProcess("FAILED", "udp_socket_not_ready");
     return;
   }
 
-  // Send the first Magic Packet immediately.
-  if (sendMagicPacket()) {
-    wolAttemptsSent = 1;
-    lastWolSendMs = millis();
-
-    publishWolStatus("SENT", "", wolAttemptsSent);
-  } else {
-    publishWolStatus("FAILED", "udp_send_failed", 1);
-    wolState = FINISHED;
-  }
+  // First packet is sent immediately; subsequent attempts are scheduled.
+  wolAttemptsSent++;
+  bool sent = sendMagicPacket();
+  lastWolSendMs = millis();
+  if (sent) publishWolStatus("SENT", "first_magic_packet_sent", wolAttemptsSent);
+  else mqttLog("wol_packet", "UDP_SEND_FAILED", "first_attempt");
 }
 
-
-void checkWolProcess() {
-  if (wolState != WAITING_PC) {
+void enqueueCommand(const String& cmdId) {
+  if (!commandQueued) {
+    queuedCmdId = cmdId;
+    commandQueued = true;
+    lastCmdId = cmdId;
+    activeCmdId = cmdId;
+    publishWolStatus("QUEUED", "another_command_is_running");
+    activeCmdId = "";
     return;
   }
 
-  unsigned long elapsed = millis() - wolStartMs;
-
-  // Give the target time to start before the first TCP check.
-  if (elapsed < PC_CHECK_DELAY_MS) {
-    return;
-  }
-
-  if (millis() - lastPcCheckMs < PC_CHECK_INTERVAL_MS) {
-    return;
-  }
-
-  lastPcCheckMs = millis();
-
-  if (isPcReachable()) {
-    publishWolStatus(
-      "ONLINE",
-      "",
-      wolAttemptsSent,
-      millis() - wolStartMs
-    );
-
-    wolState = FINISHED;
-    return;
-  }
-
-  if (elapsed >= PC_CHECK_TIMEOUT_MS) {
-    publishWolStatus(
-      "TIMEOUT",
-      "pc_not_reachable",
-      wolAttemptsSent,
-      elapsed
-    );
-
-    wolState = FINISHED;
-  }
+  activeCmdId = cmdId;
+  publishWolStatus("REJECTED", "command_queue_full");
+  activeCmdId = "";
 }
 
+void processQueuedCommand() {
+  if (!commandQueued || wolState != IDLE) return;
+  if (millis() - lastCommandStartMs < COMMAND_COOLDOWN_MS) return;
 
-// =========================
+  String nextId = queuedCmdId;
+  queuedCmdId = "";
+  commandQueued = false;
+  startWolProcess(nextId);
+}
+
+// ============================================================
 // MQTT CALLBACK
-// =========================
+// ============================================================
 
-void mqttCallback(
-  char* topic,
-  byte* payload,
-  unsigned int length
-) {
-  // Only process commands received on the expected topic.
-  if (strcmp(topic, COMMAND_TOPIC) != 0) {
-    mqttLog("wol_command", "INVALID_TOPIC");
-    return;
-  }
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  if (strcmp(topic, COMMAND_TOPIC) != 0) return;
 
   String message;
   message.reserve(length);
-
-  for (unsigned int i = 0; i < length; i++) {
-    message += static_cast<char>(payload[i]);
-  }
-
-  message.trim();
+  for (unsigned int i = 0; i < length; i++) message += static_cast<char>(payload[i]);
 
   JsonDocument doc;
   DeserializationError error = deserializeJson(doc, message);
-
   if (error) {
     mqttLog("wol_command", "INVALID_PAYLOAD", "json_parse_error");
     return;
@@ -384,202 +364,185 @@ void mqttCallback(
   const char* action = doc["action"] | "";
   const char* target = doc["target"] | "";
 
-  // Validate the command identifier before starting any operation.
-  if (strlen(cmdId) == 0) {
+  if (cmdId[0] == '\0') {
     mqttLog("wol_command", "INVALID_PAYLOAD", "missing_cmd_id");
     return;
   }
-
-  // Reject a repeated command, even if its previous execution finished.
-  if (lastCmdId == cmdId) {
-    mqttLog("wol_command", "DUPLICATE_COMMAND", "same_cmd_id");
+  if (lastCmdId == cmdId || activeCmdId == cmdId || (commandQueued && queuedCmdId == cmdId)) {
+    activeCmdId = cmdId;
+    publishWolStatus("DUPLICATE_COMMAND", "same_cmd_id");
+    activeCmdId = "";
     return;
   }
-
-  // Do not allow overlapping Wake-on-LAN operations.
-  if (wolState == WAITING_PC) {
-    mqttLog("wol_command", "BUSY", "wol_process_running");
-    return;
-  }
-
   if (strcmp(action, "WAKE") != 0) {
-    mqttLog("wol_command", "INVALID_PAYLOAD", "unknown_action");
+    activeCmdId = cmdId;
+    publishWolStatus("INVALID_PAYLOAD", "unknown_action");
+    activeCmdId = "";
+    return;
+  }
+  if (strcmp(target, TARGET_NAME) != 0) {
+    activeCmdId = cmdId;
+    publishWolStatus("INVALID_TARGET", "target_name_mismatch");
+    activeCmdId = "";
     return;
   }
 
-  if (strcmp(target, "proxmox-host") != 0) {
-    mqttLog("wol_command", "INVALID_TARGET", target);
+  if (wolState == WAITING_PC || commandQueued ||
+      (lastCommandStartMs != 0 && millis() - lastCommandStartMs < COMMAND_COOLDOWN_MS)) {
+    enqueueCommand(String(cmdId));
     return;
   }
 
   startWolProcess(String(cmdId));
 }
 
-
-// =========================
-// WLAN
-// =========================
+// ============================================================
+// WI-FI AND TIME SYNCHRONIZATION
+// ============================================================
 
 void connectWifi() {
-  // Return immediately if Wi-Fi is already connected.
   if (WiFi.status() == WL_CONNECTED) {
     wifiConnecting = false;
     return;
   }
 
-  // Monitor an ongoing connection attempt without blocking the main loop.
   if (wifiConnecting) {
     if (millis() - wifiConnectStartMs >= WIFI_CONNECT_TIMEOUT_MS) {
-      Serial.println("[WIFI] Connection timeout");
-
+      Serial.println("[WIFI] Connection timeout; retrying");
       WiFi.disconnect(false);
       wifiConnecting = false;
     }
-
     return;
   }
 
   Serial.println("[WIFI] Starting connection...");
-
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
   wifiConnecting = true;
   wifiConnectStartMs = millis();
 }
 
+void beginTimeSync() {
+  configTime(0, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
+  sntpStarted = true;
+  sntpStartMs = millis();
+  lastSntpRetryMs = millis();
+  Serial.println("[TIME] SNTP synchronization started");
+}
 
-// =========================
-// MQTT
-// =========================
-
-void connectMqtt() {
-  // Never attempt an MQTT connection without Wi-Fi.
-  if (WiFi.status() != WL_CONNECTED || mqtt.connected()) {
+void maintainTimeSync() {
+  if (WiFi.status() != WL_CONNECTED) {
+    clockIsValid = false;
+    sntpStarted = false;
     return;
   }
 
-  Serial.println("[MQTT] Connecting...");
+  time_t now = time(nullptr);
+  if (now > 1700000000) {
+    if (!clockIsValid) Serial.println("[TIME] System clock synchronized");
+    clockIsValid = true;
+    return;
+  }
 
-  // Perform one connection attempt per scheduled invocation.
-  bool connected = mqtt.connect(
-    MQTT_CLIENT_ID,
-    MQTT_USER,
-    MQTT_PASSWORD,
-    AVAILABILITY_TOPIC,
-    1,
-    true,
-    "offline"
-  );
+  clockIsValid = false;
+  if (!sntpStarted &&
+      (lastSntpRetryMs == 0 || millis() - lastSntpRetryMs >= SNTP_RETRY_INTERVAL_MS)) {
+    beginTimeSync();
+  }
+  if (sntpStarted && millis() - sntpStartMs >= SNTP_SYNC_TIMEOUT_MS) {
+    Serial.println("[TIME] SNTP has not synchronized yet; TLS remains disabled until valid time is available");
+    lastSntpRetryMs = millis();
+    sntpStarted = false;
+  }
+}
 
+// ============================================================
+// MQTT
+// ============================================================
+
+void connectMqtt() {
+  if (WiFi.status() != WL_CONNECTED || !clockIsValid || mqtt.connected()) return;
+
+  Serial.println("[MQTT] Connecting with certificate and time validation...");
+  bool connected = mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD,
+                                AVAILABILITY_TOPIC, 1, true, "offline");
   if (!connected) {
     Serial.printf("[MQTT] Connection failed, state=%d\n", mqtt.state());
-
-    // Apply exponential backoff, bounded by the configured maximum.
-    currentMqttBackoffMs = min(
-      currentMqttBackoffMs * 2,
-      MQTT_RECONNECT_MAX_MS
-    );
-
+    currentMqttBackoffMs = min(currentMqttBackoffMs * 2, MQTT_RECONNECT_MAX_MS);
     return;
   }
 
   currentMqttBackoffMs = MQTT_RECONNECT_MIN_MS;
-
   Serial.println("[MQTT] Connected");
 
   if (!mqtt.publish(AVAILABILITY_TOPIC, "online", true)) {
-    Serial.println("[MQTT] Availability publish failed");
+    Serial.println("[MQTT] Availability publish failed; check broker publish ACL");
   }
-
-  if (mqtt.subscribe(COMMAND_TOPIC, 1)) {
-    mqttLog("mqtt", "SUBSCRIBED", COMMAND_TOPIC);
-  } else {
-    mqttLog("mqtt", "SUBSCRIBE_FAILED", COMMAND_TOPIC);
-  }
-
-  mqttLog("esp32", "READY");
+  if (mqtt.subscribe(COMMAND_TOPIC, 1)) Serial.println("[MQTT] Command topic subscribed at QoS 1");
+  else Serial.println("[MQTT] Subscribe failed; check broker subscribe ACL");
 }
 
-
-// =========================
-// SETUP
-// =========================
+// ============================================================
+// SETUP AND LOOP
+// ============================================================
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
-
+  delay(500);
   Serial.println("\nESP32 Remote Wake Gateway");
   Serial.printf("Firmware: %s\n", FIRMWARE_VERSION);
 
   if (!parseMac(SERVER_MAC, targetMac)) {
-    Serial.println("[BOOT] ERROR: Invalid server MAC");
+    Serial.println("[BOOT] ERROR: Invalid server MAC; check SERVER_MAC in secrets.h");
+    Serial.flush();
+    delay(250);
     ESP.restart();
+    delay(1000);
     return;
   }
 
-  // Initialize Wi-Fi without waiting for the connection to finish.
-  connectWifi();
-
-  // Configure TLS and MQTT before the first connection attempt.
-  tlsClient.setCACert(ROOT_CA);
-
+  tlsClient.setCACert(ROOT_CA); // Certificate validation remains enabled.
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setCallback(mqttCallback);
   mqtt.setBufferSize(1024);
   mqtt.setKeepAlive(30);
+  mqtt.setSocketTimeout(2);
 
-  // Initialize a persistent UDP socket for Wake-on-LAN.
-  udpReady = udp.begin(WOL_PORT) == 1;
+  // Bind an ephemeral local UDP port; destination port is WOL_PORT.
+  udpReady = udp.begin(0) == 1;
+  if (!udpReady) Serial.println("[UDP] Socket initialization failed");
 
-  if (!udpReady) {
-    Serial.println("[UDP] Socket initialization failed");
-  }
+  connectWifi();
 }
 
-
-// =========================
-// LOOP
-// =========================
-
 void loop() {
-  // Monitor Wi-Fi and initiate a connection if necessary.
   connectWifi();
-
   bool wifiConnected = WiFi.status() == WL_CONNECTED;
 
-  // Log changes in Wi-Fi connectivity rather than logging every loop.
   if (wifiConnected && !wifiWasConnected) {
-    Serial.printf("[WIFI] Connected: %s\n",
-                  WiFi.localIP().toString().c_str());
-
+    Serial.printf("[WIFI] Connected: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("[WIFI] Broadcast: %s\n", WiFi.broadcastIP().toString().c_str());
     Serial.printf("[WIFI] RSSI: %d dBm\n", WiFi.RSSI());
-
     wifiConnecting = false;
-    mqttLog("wifi", "CONNECTED");
+    beginTimeSync();
+  } else if (!wifiConnected && wifiWasConnected) {
+    Serial.println("[WIFI] Disconnected");
+    closeTcpProbe();
   }
-
-  if (!wifiConnected && wifiWasConnected) {
-    mqttLog("wifi", "DISCONNECTED");
-  }
-
   wifiWasConnected = wifiConnected;
 
-  // Schedule MQTT reconnects using the current backoff interval.
-  if (wifiConnected && !mqtt.connected()) {
+  maintainTimeSync();
+
+  if (wifiConnected && clockIsValid && !mqtt.connected()) {
     if (millis() - lastMqttReconnectAttempt >= currentMqttBackoffMs) {
       lastMqttReconnectAttempt = millis();
       connectMqtt();
     }
   }
 
-  // Process incoming MQTT messages and maintain the connection.
+  // Keep this call frequent; the TCP probe below is non-blocking.
   mqtt.loop();
-
-  // Schedule additional Magic Packets without blocking the main loop.
   sendScheduledWolPackets();
-
-  // Continue checking whether the target computer is reachable.
   checkWolProcess();
+  processQueuedCommand();
 }
