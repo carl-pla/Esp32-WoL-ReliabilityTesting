@@ -29,15 +29,120 @@ internet connection, ESP32, and MQTT broker still need to be available.
 
 ## How it works
 
-``` mermaid
-flowchart LR
-    A["Laptop or phone"] -->|"MQTT over TLS"| B["Reachable MQTT broker"]
-    B -->|"Wake command"| C["ESP32"]
-    C -->|"Local Wake-on-LAN packet"| D["Target computer"]
-    C -->|"Status and diagnostics"| B
-    B --> E["Remote MQTT client"]
-    C -.->|"Optional TCP reachability check"| D
+
+```mermaid
+flowchart TB
+
+    subgraph REMOTE["Remote device — outside the home network"]
+        CLIENT["Laptop or smartphone<br/>MQTT client"]
+    end
+
+    subgraph CLOUD["Internet / reachable MQTT service"]
+        BROKER["MQTT broker<br/>EMQX Cloud or another compatible provider"]
+        AUTH["Broker authentication and authorization<br/>Separate accounts and topic permissions"]
+    end
+
+    subgraph HOME["Home network — behind router / CGNAT"]
+        NETWORK["Router / access point / repeater<br/>Internet access and local connectivity"]
+
+        subgraph LOCAL["Local broadcast domain"]
+            ESP["ESP32 Wake Gateway<br/>Wi-Fi connection<br/>Independently powered"]
+            TARGET["Target computer<br/>Wired Ethernet<br/>Wake-on-LAN-capable network adapter"]
+        end
+
+        POWER["Independent USB power supply<br/>Remains available when target is off"]
+    end
+
+    CLIENT -->|"1. Publish JSON wake command<br/>COMMAND_TOPIC · MQTT over TLS"| BROKER
+
+    BROKER ---|"Enforces access permissions"| AUTH
+
+    ESP -->|"2. Initiate and maintain outbound connection<br/>Authenticate and subscribe to COMMAND_TOPIC<br/>MQTT over TLS through home router"| BROKER
+
+    BROKER -->|"3. Deliver wake command<br/>over the existing connection"| ESP
+
+    ESP -->|"4. Validate command<br/>Generate and send local UDP broadcast<br/>102-byte magic packet · WOL_PORT"| TARGET
+
+    ESP -.->|"5. After a delay, connect to<br/>TARGET_IP : TARGET_CHECK_PORT"| TARGET
+
+    ESP -->|"6. Publish command results and diagnostics<br/>STATUS_TOPIC / LOG_TOPIC"| BROKER
+
+    BROKER -->|"7. Deliver feedback to subscribed client<br/>Correlated using cmd_id"| CLIENT
+
+    POWER -->|"Continuous power"| ESP
+    NETWORK ---|"Wi-Fi"| ESP
+    NETWORK ---|"Ethernet, directly or through a bridge/repeater"| TARGET
+
+    CLIENT -.->|"Optional remote access after startup<br/>For example: Tailscale + SSH / remote desktop"| TARGET
+
+    classDef device fill:#6699ee,stroke:#365e9d,stroke-width:2px,color:#10213b;
+    classDef broker fill:#ffa34d,stroke:#b86516,stroke-width:2px,color:#33200e;
+    classDef infrastructure fill:#e8edf3,stroke:#62748c,stroke-width:1.5px,color:#172b4d;
+    classDef power fill:#d9f2df,stroke:#228453,stroke-width:1.5px,color:#123820;
+    classDef security fill:#eee5ff,stroke:#8250c4,stroke-width:1.5px,color:#35204f;
+
+    class CLIENT,ESP,TARGET device;
+    class BROKER broker;
+    class NETWORK infrastructure;
+    class POWER power;
+    class AUTH security;
+
+    style REMOTE fill:#eaf2ff,stroke:#6699ee,stroke-width:2px,color:#10213b
+    style CLOUD fill:#fff0de,stroke:#ffa34d,stroke-width:2px,color:#33200e
+    style HOME fill:#fff4af,stroke:#c7a900,stroke-width:2px,color:#332d0b
+    style LOCAL fill:#fffbe3,stroke:#c7a900,stroke-width:1px,color:#332d0b
 ```
+
+### Connection model
+
+The remote MQTT client and the ESP32 each establish their own connection
+to the broker.
+
+The ESP32 initiates its connection from inside the home network.
+The broker delivers wake commands over that existing connection; it does
+not need to initiate a new inbound connection through the home router.
+
+This avoids requiring inbound IPv4 port forwarding for the wake workflow.
+
+The broker, ESP32, power supply, and network infrastructure must remain
+available while the target computer is shut down.
+
+The target computer is not required to run an MQTT client.
+
+### Local wake-up
+
+The ESP32 validates the received command and constructs a Wake-on-LAN
+magic packet containing the configured target MAC address.
+
+The packet is sent as a local UDP broadcast using the configured
+`BROADCAST_IP` and `WOL_PORT`.
+
+The ESP32 and the target network adapter must share the broadcast domain
+used for this transmission. Client isolation or broadcast filtering can
+prevent delivery even when both devices have internet access.
+
+### Feedback and verification
+
+The ESP32 publishes command results to `STATUS_TOPIC` and diagnostic
+events to `LOG_TOPIC`.
+
+The remote MQTT client subscribes to those topics to receive feedback.
+
+A command ID associates the received command with its status events.
+
+The TCP verification check targets a configured service, not the
+computer's hardware power state.
+
+### Separate remote-access path
+
+Tailscale or another remote-access solution can be used after the target
+computer starts.
+
+This is separate from the MQTT wake workflow. The wake command does not
+need a VPN connection when both MQTT clients can reach the broker.
+
+The diagram shows the logical remote-access path, not a guarantee of a
+direct peer-to-peer connection.
 
 1.  A laptop, phone, or other MQTT client publishes a wake command.
 2.  The MQTT broker forwards the command to the ESP32.
