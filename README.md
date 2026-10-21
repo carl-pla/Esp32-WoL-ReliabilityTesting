@@ -8,8 +8,7 @@ sends a Wake-on-LAN magic packet to a computer on the same local
 network. It can also publish status messages so you can see which step
 of the process was reached.
 
-> **Project status:** Work in progress. This is a personal/lab
-> prototype, not a production-ready or high-availability system. Test
+> **Project status:** Work in progress. Test
 > results and measured reliability will be added as testing continues.
 
 ## Why build this?
@@ -238,15 +237,10 @@ latency, power-consumption, or energy-saving figures are claimed yet.
 
 Planned checks include:
 
--   Firmware build and upload
 -   Local Wake-on-LAN before testing MQTT
 -   Remote wake command through the broker
 -   Status messages for successful and unsuccessful attempts
--   Reconnection after Wi-Fi or MQTT interruption
--   Behaviour when the target is already online
--   Behaviour when the target does not become reachable
--   Power consumption of the ESP32 and target computer, if energy
-    savings are evaluated
+
 
 When results are available, record the test setup, number of attempts,
 successes/failures, measured timings, and any limitations. Keep observed
@@ -254,13 +248,10 @@ results separate from expected behaviour.
 
 ## Known limitations
 
--   This is a prototype and is not production-ready.
 -   Reconnection routines may block other firmware work.
 -   Duplicate-command protection is limited and does not persist across
     restarts.
 -   Overlapping commands need further hardening.
--   Diagnostic messages may be lost during connectivity failures; there
-    is no persistent offline event buffer.
 -   A connected MQTT client does not by itself prove that command
     subscription permissions are correct.
 -   A successful MQTT publish call is not an end-to-end acknowledgement
@@ -268,8 +259,7 @@ results separate from expected behaviour.
 -   `ONLINE` means a configured TCP service responded, not that hardware
     power state was independently confirmed.
 -   `TIMEOUT` does not identify the root cause of a failed check.
--   The ESP32, power supply, Wi-Fi access point, internet connection,
-    and broker are potential single points of failure.
+
 
 ## Remote access is separate
 
